@@ -31,6 +31,9 @@ __all__ = [
     "save_checkpoint",
 ]
 
+from dt.dt import CHECKPOINT_FORMAT, DTPolicy, HuggingfaceDT, load_checkpoint, masked_mse, one_hot_actions, \
+    save_checkpoint
+
 
 def __getattr__(name: str) -> Any:
     """Resolve the model symbols on first access (keeps ``dt.data`` light)."""

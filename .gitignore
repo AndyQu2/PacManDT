@@ -16,6 +16,7 @@ htmlcov/
 
 # Collected Decision-Transformer trajectories
 /data/
+/output/
 *.npz
 
 # Local artefacts

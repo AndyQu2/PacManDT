@@ -486,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--policy", type=str, default="heuristic",
                       help="behaviour policy used for collection")
     data.add_argument("--epsilon", type=float, default=0.05, help="exploration for collection")
-    data.add_argument("--workers", type=int, default=1, help="parallel collectors")
+    data.add_argument("--workers", type=int, default=8, help="parallel collectors")
     data.add_argument("--keep-won-only", action="store_true", help="keep only winning episodes")
     data.add_argument("--eval-fraction", type=float, default=0.1,
                       help="fraction of episodes held out for evaluation")
@@ -499,7 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--dropout", type=float, default=0.1)
 
     optim = parser.add_argument_group("optimisation")
-    optim.add_argument("--epochs", type=int, default=5)
+    optim.add_argument("--epochs", type=int, default=100)
     optim.add_argument("--batch-size", type=int, default=64)
     optim.add_argument("--lr", type=float, default=1e-4)
     optim.add_argument("--weight-decay", type=float, default=1e-4)

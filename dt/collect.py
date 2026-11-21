@@ -49,7 +49,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pacman_env.game.map import Map
 
-from dt.data import (
+from data import (
     DEFAULT_SUCCESS_THRESHOLD,
     DataCollector,
     Episode,
@@ -154,7 +154,7 @@ def print_shapes(
     hint = recommend_max_length(
         layout=layout, max_steps=max_steps if max_steps else DEFAULT_MAX_STEPS
     )
-    if hint != max_length:
+    if hint < max_length:
         print(_row("hint", f"--max-length {hint} caps long episodes and saves disk space"))
 
 
@@ -185,6 +185,7 @@ def save_hf(
     layout: str,
     args: argparse.Namespace,
     max_steps: Optional[int],
+    verbose: bool = True,
 ) -> Dict[str, Any]:
     """Write a Hugging Face ``DatasetDict`` directory and return its summary."""
     collector = DataCollector(
@@ -206,12 +207,13 @@ def save_hf(
     path = collector.save_to_disk(out)
 
     splits = {name: len(split) for name, split in collector.dataset_dict.items()}
-    print(f"\nSaved {len(episodes)} episodes to {path}")
-    for name, split in collector.dataset_dict.items():
-        shape = split.features["observations"].shape
-        print(_row(name, f"{len(split)} episodes, observations {shape} int8"))
-    print(_row("metadata", path / "pacman_dt_metadata.json"))
-    print(_row("dataset card", path / "README.md"))
+    if verbose:
+        print(f"\nSaved {len(episodes)} episodes to {path}")
+        for name, split in collector.dataset_dict.items():
+            shape = split.features["observations"].shape
+            print(_row(name, f"{len(split)} episodes, observations {shape} int8"))
+        print(_row("metadata", path / "pacman_dt_metadata.json"))
+        print(_row("dataset card", path / "README.md"))
     return {"path": path, "splits": splits, "dataset_dict": collector.dataset_dict}
 
 
@@ -222,6 +224,7 @@ def save_npz(
     layout: str,
     args: argparse.Namespace,
     max_steps: Optional[int],
+    verbose: bool = True,
 ) -> Dict[str, Any]:
     """Write a ``.npz`` archive and return its summary."""
     metadata = {
@@ -247,13 +250,16 @@ def save_npz(
     )
 
     arrays, _ = load_dataset(path)
-    print(f"\nSaved {len(episodes)} episodes to {path}")
-    for key in ("observations", "actions", "rewards", "returns_to_go", "timesteps", "mask"):
-        print(_row(key, f"{arrays[key].shape} {arrays[key].dtype}"))
+    if verbose:
+        print(f"\nSaved {len(episodes)} episodes to {path}")
+        for key in ("observations", "actions", "rewards", "returns_to_go", "timesteps", "mask"):
+            print(_row(key, f"{arrays[key].shape} {arrays[key].dtype}"))
     return {"path": path, "splits": {"train": len(episodes)}, "arrays": arrays}
 
 
-def verify(path: Path, fmt: str, expected_episodes: int) -> Dict[str, Any]:
+def verify(
+    path: Path, fmt: str, expected_episodes: int, *, verbose: bool = True
+) -> Dict[str, Any]:
     """Reload what was just written and check it is complete.
 
     A dataset that cannot be reloaded is worthless, so this is the last thing
@@ -279,9 +285,10 @@ def verify(path: Path, fmt: str, expected_episodes: int) -> Dict[str, Any]:
             f"but read back {found}"
         )
 
-    print("\nVerified on disk")
-    print(_row("episodes", f"{found}  ({', '.join(f'{k} {v}' for k, v in splits.items())})"))
-    print(_row("readable", "yes - reloaded with the public loaders"))
+    if verbose:
+        print("\nVerified on disk")
+        print(_row("episodes", f"{found}  ({', '.join(f'{k} {v}' for k, v in splits.items())})"))
+        print(_row("readable", "yes - reloaded with the public loaders"))
     return {
         "episodes": found,
         "splits": splits,
@@ -427,9 +434,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         kept = [episode for episode in kept if episode.info.get("win", False)]
     kept = filter_episodes(kept, min_return=args.min_return)
     if not kept:
+        hint = "Try lowering --min-return"
+        if args.keep_won_only:
+            hint = "No episode cleared the maze - raise --max-steps or drop --keep-won-only"
         print(
-            "\nNo episodes left after filtering - nothing written. "
-            "Try lowering --min-return or dropping --keep-won-only.",
+            f"\nNo episodes left after filtering - nothing written. {hint}.",
             file=sys.stderr,
         )
         return 1
@@ -442,14 +451,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # ---- 3. save ------------------------------------------------------
     if args.format == "hf":
-        saved = save_hf(kept, out=out, layout=args.layout, args=args, max_steps=max_steps)
+        saved = save_hf(
+            kept, out=out, layout=args.layout, args=args,
+            max_steps=max_steps, verbose=not args.quiet,
+        )
     else:
-        saved = save_npz(kept, out=out, layout=args.layout, args=args, max_steps=max_steps)
+        saved = save_npz(
+            kept, out=out, layout=args.layout, args=args,
+            max_steps=max_steps, verbose=not args.quiet,
+        )
     path = saved["path"]
 
     # ---- 4. verify ----------------------------------------------------
-    verified = verify(path, args.format, len(kept))
+    verified = verify(path, args.format, len(kept), verbose=not args.quiet)
     if not args.quiet:
+        print()
         print_shapes(
             state_dim=verified["dims"]["state_dim"],
             act_dim=verified["dims"]["act_dim"],
@@ -467,8 +483,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not args.quiet:
         print_next_steps(path, args.format)
+    else:
+        print(path)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
