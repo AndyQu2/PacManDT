@@ -1,0 +1,14 @@
+gymnasium>=1.0
+numpy>=1.24
+pygame-ce>=2.5
+
+# Optional, needed by examples/train_sb3.py (or: pip install -e ".[train]")
+# stable-baselines3>=2.0
+
+# Optional, needed by dt.data.hf_dataset / python -m dt.data --format hf
+# (or: pip install -e ".[hub]")
+# datasets>=3.0
+# huggingface_hub>=0.26
+
+torch
+transformers
