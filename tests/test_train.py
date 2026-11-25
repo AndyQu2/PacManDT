@@ -1,4 +1,4 @@
-"""Tests for the ``python -m dt.train`` training program."""
+﻿"""Tests for the ``python -m dt.train`` training program."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 
 import numpy as np
 import pytest
+import torch
 
 from dt.data import (
     Episode,
@@ -15,10 +16,13 @@ from dt.data import (
     save_dataset,
 )
 from dt.dt import load_checkpoint
+import dt.train as train_module
 from dt.train import (
     _episodes_from_npz,
     _resolve_context_length,
+    _resolve_device,
     build_parser,
+    configure_cuda,
     main,
     mean_return_of,
     return_scale_of,
@@ -230,3 +234,104 @@ def test_main_eval_only_runs_a_rollout(tmp_path):
                 "--max-steps", "5",
             ]
         )
+
+
+# ----------------------------------------------------------------------
+# CUDA configuration
+# ----------------------------------------------------------------------
+class FakeStream:
+    def __init__(self, priority: int = 0) -> None:
+        self.priority = priority
+
+
+# ``torch.backends.*`` flags are dynamic attributes, so ``monkeypatch`` cannot
+# restore them; snapshot and put them back by hand.
+TORCH_FLAGS = (
+    (torch.backends.cuda.matmul, "allow_tf32"),
+    (torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"),
+    (torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"),
+    (torch.backends.cudnn, "allow_tf32"),
+    (torch.backends.cudnn, "benchmark"),
+    (torch.backends.cudnn, "deterministic"),
+)
+
+
+@pytest.fixture
+def torch_flags():
+    saved = [(obj, name, getattr(obj, name)) for obj, name in TORCH_FLAGS]
+    precision = torch.get_float32_matmul_precision()
+    yield
+    for obj, name, value in saved:
+        setattr(obj, name, value)
+    torch.set_float32_matmul_precision(precision)
+
+
+def test_parser_device_defaults_to_auto_detect():
+    args = build_parser().parse_args([])
+    assert args.device is None
+    assert _resolve_device("cpu").type == "cpu"
+    assert _resolve_device("cuda:0").type == "cuda"
+
+
+def test_configure_cuda_is_a_noop_on_cpu(monkeypatch, torch_flags):
+    for obj, name in TORCH_FLAGS:
+        setattr(obj, name, False)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *a, **k: pytest.fail("stream created on cpu"))
+
+    assert configure_cuda(torch.device("cpu")) is False
+    assert torch.backends.cuda.matmul.allow_tf32 is False
+    assert torch.backends.cudnn.allow_tf32 is False
+    assert torch.backends.cudnn.benchmark is False
+
+
+def test_configure_cuda_is_a_noop_when_cuda_is_unavailable(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *a, **k: pytest.fail("stream created without cuda"))
+
+    assert configure_cuda(torch.device("cuda")) is False
+
+
+def test_configure_cuda_applies_the_settings_on_gpu(monkeypatch, torch_flags):
+    applied = []
+    stream = FakeStream(priority=-1)
+    for obj, name in TORCH_FLAGS:
+        setattr(obj, name, False)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(torch._C, "_accelerator_setAllocatorSettings", applied.append)
+    monkeypatch.setattr(torch.cuda.memory, "_set_allocator_settings", applied.append)
+    monkeypatch.setattr(
+        torch.cuda, "set_per_process_memory_fraction", lambda fraction, *a: applied.append(fraction)
+    )
+    monkeypatch.setattr(torch.cuda, "Stream", lambda priority=0: stream)
+    monkeypatch.setattr(torch.cuda, "set_stream", applied.append)
+
+    assert configure_cuda(torch.device("cuda")) is True
+
+    assert "max_split_size_mb:128" in applied
+    assert 0.9 in applied
+    assert applied[-1] is stream, "the high-priority stream must be the current stream"
+    assert torch.get_float32_matmul_precision() == "high"
+    assert torch.backends.cuda.matmul.allow_tf32 is True
+    assert torch.backends.cudnn.allow_tf32 is True
+    assert torch.backends.cudnn.benchmark is True
+    assert torch.backends.cudnn.deterministic is False
+    assert torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction is True
+    assert torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction is True
+    assert train_module._CUDA_STREAM is stream
+
+
+def test_configure_cuda_survives_a_missing_allocator_hook(monkeypatch, torch_flags):
+    def boom(*args, **kwargs):
+        raise AttributeError("not available")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    monkeypatch.setattr(torch._C, "_accelerator_setAllocatorSettings", boom)
+    monkeypatch.setattr(torch.cuda.memory, "_set_allocator_settings", boom)
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", boom)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda priority=0: FakeStream(priority))
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda s: None)
+
+    assert configure_cuda(torch.device("cuda")) is True

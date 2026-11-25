@@ -49,7 +49,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pacman_env.game.map import Map
 
-from dt.data import (
+from data import (
     DEFAULT_SUCCESS_THRESHOLD,
     DataCollector,
     Episode,

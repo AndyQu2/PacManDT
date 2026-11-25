@@ -57,7 +57,7 @@ import torch
 from torch import nn
 from transformers import DecisionTransformerConfig
 
-from dt.data import (
+from data import (
     DEFAULT_CONTEXT_LENGTH,
     DataCollector,
     Episode,
@@ -479,7 +479,8 @@ def build_parser() -> argparse.ArgumentParser:
     optim.add_argument("--max-grad-norm", type=float, default=0.25)
     optim.add_argument("--num-workers", type=int, default=8, help="dataloader workers")
     optim.add_argument("--seed", type=int, default=0)
-    optim.add_argument("--device", type=str, default="cuda", help="cpu / cuda / mps")
+    optim.add_argument("--device", type=str, default=None,
+                       help="cpu / cuda / mps (default: cuda when available, else cpu)")
     optim.add_argument("--log-every", type=int, default=50)
     optim.add_argument("--quiet", action="store_true")
 
@@ -519,6 +520,73 @@ def _resolve_device(name: Optional[str]) -> torch.device:
     return torch.device("cpu")
 
 
+#: Kept alive for the whole process: dropping the handle while it is the current
+#: stream would leave later kernel launches pointing at freed state.
+_CUDA_STREAM: Optional[torch.cuda.Stream] = None
+
+
+def configure_cuda(device: torch.device) -> bool:
+    """Apply the process-wide CUDA performance settings before training starts.
+
+    Returns ``True`` when the settings were applied, ``False`` on CPU or when CUDA
+    is unavailable (in which case nothing is touched).  Call this exactly once,
+    before the model allocates any GPU memory.
+    """
+    global _CUDA_STREAM
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+
+    # Allocator: smaller split blocks cut fragmentation.  The supported entry point
+    # is the private ``_C`` hook; older builds only expose the deprecated wrapper.
+    for apply_settings in (
+        getattr(torch._C, "_accelerator_setAllocatorSettings", None),
+        getattr(torch.cuda.memory, "_set_allocator_settings", None),
+    ):
+        if apply_settings is None:  # pragma: no cover - version dependent
+            continue
+        try:
+            apply_settings("max_split_size_mb:128")
+            break
+        except (AttributeError, RuntimeError, TypeError):  # pragma: no cover
+            continue
+
+    # Leave 10% of the card to the desktop compositor.  This is a hard cap, not a
+    # reservation: PyTorch raises OOM above it, so it must stay above the real
+    # peak (this trainer peaks around 1-2 GB).
+    try:
+        torch.cuda.set_per_process_memory_fraction(0.9)
+    except (AttributeError, RuntimeError):  # pragma: no cover - version dependent
+        pass
+
+    # TF32: ~2x fp32 matmul throughput on Ampere and newer, at ~1e-3 relative
+    # error - irrelevant next to the accuracy this task needs.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    if torch.cuda.is_bf16_supported():  # pragma: no cover - hardware dependent
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+
+    # cuDNN: shapes are fixed for the whole run, so autotuning is a one-off win.
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+    # Run every op on a high-priority stream so the GPU queues training work ahead
+    # of lower-priority host work.
+    _CUDA_STREAM = torch.cuda.Stream(priority=-1)
+    torch.cuda.set_stream(_CUDA_STREAM)
+    return True
+
+
+# Two entries from the original tuning snippet are deliberately absent:
+#   ``torch.cuda.enable_graphs = True``  - no such API; it only creates a dead
+#       attribute.  CUDA graphs need an explicit capture/replay of a static batch
+#       (``torch.cuda.CUDAGraph``), which changes the training loop's shape.
+#   ``torch.cuda.memory.caching_allocator_alloc(0)``  - hands back a raw 0-byte
+#       pointer that has to be freed by hand and warms nothing.
+
+
 def _max_length_of(dataset_dict: Dict[str, Any], args: argparse.Namespace) -> int:
     train = dataset_dict["train"]
     if "observations" in train.features:
@@ -529,6 +597,12 @@ def _max_length_of(dataset_dict: Dict[str, Any], args: argparse.Namespace) -> in
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     device = _resolve_device(args.device)
+    if configure_cuda(device):
+        print(
+            f"[cuda] {torch.cuda.get_device_name(device)} tf32=True "
+            f"matmul_precision={torch.get_float32_matmul_precision()} "
+            f"allocator=max_split_size_mb:128 mem_fraction=0.90 stream=high-priority"
+        )
 
     # ---- inference only ---------------------------------------------
     if args.eval_only:
