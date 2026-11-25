@@ -231,6 +231,22 @@ class DTPolicy:
         if self._rewards:
             self._rewards[-1] = float(reward)
 
+    def observe_action(self, action: int) -> None:
+        """Report the action that was *actually* executed.
+
+        :meth:`act` records its own greedy choice in the context window.  When a
+        human overrides that choice - ``python -m dt.eval --mode interactive``
+        does exactly that - call this afterwards so the context the model sees
+        stays truthful and the agent picks up where the human left off.
+        """
+        action = int(action)
+        if not 0 <= action < self.model.act_dim:
+            raise ValueError(
+                f"action {action} is outside the action space [0, {self.model.act_dim})"
+            )
+        if self._actions:
+            self._actions[-1] = self._eye[action]
+
     @property
     def conditioned_return(self) -> float:
         """The target return as the model sees it (after normalisation)."""

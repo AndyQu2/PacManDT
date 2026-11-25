@@ -57,12 +57,12 @@ import torch
 from torch import nn
 from transformers import DecisionTransformerConfig
 
-from data import (
+from dt.data import (
     DEFAULT_CONTEXT_LENGTH,
     DataCollector,
     Episode,
     dims_from_dataset,
-    iter_episodes,
+    episodes_from_npz,
     load_dataset,
     make_dt_dataloader,
     recommend_context_length,
@@ -79,34 +79,7 @@ DEFAULT_RETURN_SCALE = 1.0
 # ----------------------------------------------------------------------
 def _episodes_from_npz(path: Path) -> List[Episode]:
     """Rebuild :class:`Episode` objects from a ``dt.data`` ``.npz`` file."""
-    arrays, metadata = load_dataset(path)
-    episodes: List[Episode] = []
-    for index, chunk in enumerate(iter_episodes(arrays)):
-        success = bool(arrays["episode_success"][index]) if "episode_success" in arrays else False
-        episodes.append(
-            Episode(
-                observations=np.asarray(chunk["observations"]),
-                actions=np.asarray(chunk["actions"], dtype=np.int64),
-                rewards=np.asarray(chunk["rewards"], dtype=np.float32),
-                terminated=np.asarray(chunk["terminated"], dtype=bool),
-                truncated=np.asarray(chunk["truncated"], dtype=bool),
-                returns_to_go=np.asarray(chunk["returns_to_go"], dtype=np.float32),
-                timesteps=np.asarray(chunk["timesteps"], dtype=np.int64),
-                seed=int(metadata.get("seed", 0)),
-                layout=str(metadata.get("layout", "unknown")),
-                score=int(arrays["episode_scores"][index]) if "episode_scores" in arrays else 0,
-                total_reward=(
-                    float(arrays["episode_returns"][index])
-                    if "episode_returns" in arrays
-                    else float(np.sum(chunk["rewards"]))
-                ),
-                success=success,
-                info={"win": success},
-            )
-        )
-    if not episodes:
-        raise ValueError(f"{path} contains no episodes")
-    return episodes
+    return episodes_from_npz(path)
 
 
 def get_dataset(args: argparse.Namespace) -> Tuple[Dict[str, Any], str]:

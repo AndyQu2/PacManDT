@@ -371,6 +371,9 @@ def pad_episodes(
         "episode_returns": np.asarray([episode.total_reward for episode in episodes], dtype=np.float32),
         "episode_scores": np.asarray([episode.score for episode in episodes], dtype=np.int64),
         "episode_success": np.asarray([episode.success for episode in episodes], dtype=bool),
+        "episode_wins": np.asarray(
+            [bool(episode.info.get("win", False)) for episode in episodes], dtype=bool
+        ),
         "episode_seeds": np.asarray([episode.seed for episode in episodes], dtype=np.int64),
     }
 
@@ -516,6 +519,48 @@ def load_dataset(path: Union[str, Path]) -> Tuple[Dict[str, np.ndarray], Dict[st
     return arrays, metadata
 
 
+def episodes_from_npz(path: Union[str, Path]) -> List[Episode]:
+    """Rebuild :class:`Episode` objects from a ``.npz`` written by :func:`save_dataset`.
+
+    This is the inverse of :func:`save_dataset`, so a saved dataset can be fed
+    straight back into :func:`dataset_statistics`, :func:`filter_episodes` or the
+    Hugging Face exporter.  Padding is dropped: every episode is cut back to its
+    stored ``length``.
+    """
+    arrays, metadata = load_dataset(path)
+    episodes: List[Episode] = []
+    for index, chunk in enumerate(iter_episodes(arrays)):
+        seed = int(arrays["episode_seeds"][index]) if "episode_seeds" in arrays else 0
+        episodes.append(
+            Episode(
+                observations=np.asarray(chunk["observations"]),
+                actions=np.asarray(chunk["actions"], dtype=np.int64),
+                rewards=np.asarray(chunk["rewards"], dtype=np.float32),
+                terminated=np.asarray(chunk["terminated"], dtype=bool),
+                truncated=np.asarray(chunk["truncated"], dtype=bool),
+                returns_to_go=np.asarray(chunk["returns_to_go"], dtype=np.float32),
+                timesteps=np.asarray(chunk["timesteps"], dtype=np.int64),
+                seed=seed,
+                layout=str(metadata.get("layout", "unknown")),
+                score=int(arrays["episode_scores"][index]) if "episode_scores" in arrays else 0,
+                total_reward=(
+                    float(arrays["episode_returns"][index])
+                    if "episode_returns" in arrays
+                    else float(np.sum(chunk["rewards"]))
+                ),
+                success=bool(arrays["episode_success"][index]) if "episode_success" in arrays else False,
+                info={
+                    "win": bool(arrays["episode_wins"][index])
+                    if "episode_wins" in arrays
+                    else False
+                },
+            )
+        )
+    if not episodes:
+        raise ValueError(f"{path} contains no episodes")
+    return episodes
+
+
 __all__ = [
     "Episode",
     "DATASET_FORMAT",
@@ -528,4 +573,5 @@ __all__ = [
     "filter_episodes",
     "save_dataset",
     "load_dataset",
+    "episodes_from_npz",
 ]
