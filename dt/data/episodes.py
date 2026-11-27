@@ -25,6 +25,12 @@ valid, so variable-length episodes can be batched with normal tensor ops.
 ``terminated`` marks a real end of episode (win or game over) while
 ``truncated`` marks a time-limit cut.  Returns-to-go are always computed over
 the steps that were actually recorded.
+
+Observations are recorded in one of two modes (see :mod:`dt.data.observations`):
+``"state"`` keeps the environment's single ``(rows, cols)`` grid, ``"ghost"``
+stacks the ghost/player channels into ``(channels, rows, cols)``.  The mode is
+stored on every :class:`Episode` and in the ``.npz`` header, so the trainer can
+rebuild the same observation for its rollouts.
 """
 
 from __future__ import annotations
@@ -40,6 +46,14 @@ import numpy as np
 
 from pacman_env.env import PacmanEnv
 
+from .observations import (
+    STATE_OBS_MODE,
+    GhostObservationConfig,
+    observation_from_metadata,
+    observation_metadata,
+    resolve_observation,
+    wrap_observation,
+)
 from .policies import Policy, make_policy
 
 #: Reward an episode must reach to be labelled ``success=True``.  A competent
@@ -69,6 +83,12 @@ class Episode:
     total_reward: float = 0.0
     success: bool = False
     info: Dict[str, Any] = field(default_factory=dict)
+    #: Observation mode the episode was recorded with (``"state"`` or ``"ghost"``).
+    obs_mode: str = STATE_OBS_MODE
+    #: Behaviour policy that generated the episode (``"heuristic"``, ``"random"``...).
+    policy: str = "unknown"
+    #: Full description of the observation layout (channels, dtype, distance cap).
+    observation_meta: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def length(self) -> int:
@@ -113,8 +133,17 @@ def collect_episode(
     seed: Optional[int] = None,
     gamma: float = 0.99,
     success_threshold: float = DEFAULT_SUCCESS_THRESHOLD,
+    obs_mode: str = STATE_OBS_MODE,
+    obs_meta: Optional[Dict[str, Any]] = None,
+    policy_name: str = "unknown",
 ) -> Episode:
-    """Roll out ``policy`` in ``env`` until the episode ends."""
+    """Roll out ``policy`` in ``env`` until the episode ends.
+
+    ``env`` may be the raw :class:`~pacman_env.env.PacmanEnv` or one wrapped by
+    :class:`~dt.data.observations.GhostObservationWrapper`; ``obs_mode`` and
+    ``obs_meta`` are only recorded on the returned episode so the dataset
+    documents how its observations were produced.
+    """
     obs, info = env.reset(seed=seed)
     reset = getattr(policy, "reset", None)
     if callable(reset):
@@ -159,13 +188,23 @@ def collect_episode(
             "lives": int(info.get("lives", 0)),
             "pellets_remaining": int(info.get("pellets_remaining", 0)),
         },
+        obs_mode=str(obs_mode),
+        policy=str(policy_name),
+        observation_meta=dict(obs_meta or {}),
     )
+
+
+def _behaviour_name(spec: Any, behaviour: Policy) -> str:
+    """Human-readable name of a behaviour policy (used for dataset metadata)."""
+    if isinstance(spec, str):
+        return spec.lower().replace("-", "_")
+    return str(getattr(behaviour, "__name__", type(behaviour).__name__))
 
 
 def _collect_chunk(task: Tuple[Any, ...]) -> List[Episode]:
     """Worker entry point used by the multiprocessing collector."""
     (layout, lives, count, max_steps, policy, epsilon, seed, gamma, threshold,
-     frame_skip, render_mode) = task
+     frame_skip, render_mode, obs_mode, obs_config, schedule) = task
     return collect_trajectories(
         layout=layout,
         lives=lives,
@@ -180,6 +219,9 @@ def _collect_chunk(task: Tuple[Any, ...]) -> List[Episode]:
         render_mode=render_mode,
         progress=False,
         workers=1,
+        obs_mode=obs_mode,
+        obs_config=obs_config,
+        policy_schedule=schedule,
     )
 
 
@@ -198,6 +240,9 @@ def collect_trajectories(
     progress: bool = True,
     workers: int = 1,
     num_episode: Optional[int] = None,
+    obs_mode: str = STATE_OBS_MODE,
+    obs_config: Optional[GhostObservationConfig] = None,
+    policy_schedule: Optional[Sequence[Union[str, Policy]]] = None,
 ) -> List[Episode]:
     """Collect ``num_episodes`` Decision-Transformer episodes.
 
@@ -218,6 +263,19 @@ def collect_trajectories(
     workers:
         Number of processes used to collect chunks of episodes in parallel.
         Results are identical to ``workers=1``.
+    obs_mode:
+        ``"state"`` (the environment's single-channel grid, default) or
+        ``"ghost"`` - the ghost/player-aware stack from
+        :mod:`dt.data.observations`.  The environment object is left untouched;
+        the channels are added by a wrapper.
+    obs_config:
+        Channel selection for ``obs_mode="ghost"``
+        (:class:`~dt.data.observations.GhostObservationConfig`).
+    policy_schedule:
+        Optional per-episode list of policy specs (length ``num_episodes``).
+        Episode ``i`` is rolled out with ``policy_schedule[i]`` instead of
+        ``policy``; this is how the collection protocol mixes behaviour
+        policies (see :mod:`dt.data.protocol`).
     num_episode:
         Deprecated alias for ``num_episodes``.
     """
@@ -234,23 +292,39 @@ def collect_trajectories(
         raise ValueError("max_steps must be a positive integer")
 
     workers = max(1, int(workers))
+    schedule: Optional[List[Union[str, Policy]]] = None
+    if policy_schedule is not None:
+        schedule = list(policy_schedule)
+        if len(schedule) != num_episodes:
+            raise ValueError(
+                f"policy_schedule has {len(schedule)} entries but {num_episodes} "
+                "episodes were requested"
+            )
+
     if workers > 1 and num_episodes > 1:
         return _collect_parallel(
             layout=layout, lives=lives, num_episodes=num_episodes, max_steps=max_steps,
             success_threshold=success_threshold, policy=policy, seed=seed, gamma=gamma,
             frame_skip=frame_skip, epsilon=epsilon, render_mode=render_mode,
-            progress=progress, workers=workers,
+            progress=progress, workers=workers, obs_mode=obs_mode,
+            obs_config=obs_config, policy_schedule=schedule,
         )
 
-    env = PacmanEnv(
-        layout=layout,
-        render_mode=render_mode,
-        player_lives=lives,
-        max_steps=max_steps,
-        frame_skip=frame_skip,
+    resolved = resolve_observation(obs_mode, layout=layout, config=obs_config)
+    obs_meta = resolved.as_dict()
+    env = wrap_observation(
+        PacmanEnv(
+            layout=layout,
+            render_mode=render_mode,
+            player_lives=lives,
+            max_steps=max_steps,
+            frame_skip=frame_skip,
+        ),
+        resolved.mode,
+        obs_config,
     )
-    behaviour = make_policy(policy, epsilon=epsilon)
 
+    policies: Dict[str, Policy] = {}
     episodes: List[Episode] = []
     returns: List[float] = []
     successes = 0
@@ -259,11 +333,21 @@ def collect_trajectories(
 
     try:
         for index in range(num_episodes):
+            spec: Any = policy if schedule is None else schedule[index]
+            if isinstance(spec, str):
+                behaviour = policies.get(spec)
+                if behaviour is None:
+                    behaviour = make_policy(spec, epsilon=epsilon)
+                    policies[spec] = behaviour
+            else:
+                behaviour = spec
             episode_seed = int(seed) + index
             rng = np.random.default_rng(episode_seed)
             episode = collect_episode(
                 env, behaviour, rng, seed=episode_seed,
                 gamma=gamma, success_threshold=success_threshold,
+                obs_mode=resolved.mode, obs_meta=obs_meta,
+                policy_name=_behaviour_name(spec, behaviour),
             )
             episodes.append(episode)
             returns.append(episode.total_reward)
@@ -300,6 +384,9 @@ def _collect_parallel(
     render_mode: Optional[str],
     progress: bool,
     workers: int,
+    obs_mode: str = STATE_OBS_MODE,
+    obs_config: Optional[GhostObservationConfig] = None,
+    policy_schedule: Optional[Sequence[Union[str, Policy]]] = None,
 ) -> List[Episode]:
     from concurrent.futures import ProcessPoolExecutor
 
@@ -308,9 +395,13 @@ def _collect_parallel(
     tasks = []
     for start in range(0, num_episodes, chunk_size):
         count = min(chunk_size, num_episodes - start)
+        schedule = None
+        if policy_schedule is not None:
+            schedule = list(policy_schedule[start:start + count])
         tasks.append((
             layout, lives, count, max_steps, policy, epsilon, int(seed) + start,
             gamma, success_threshold, frame_skip, render_mode,
+            obs_mode, obs_config, schedule,
         ))
 
     episodes: List[Episode] = []
@@ -464,11 +555,15 @@ def save_dataset(
     obs_dtype: Optional[np.dtype] = None,
     compress: bool = True,
     max_length: Optional[int] = None,
+    obs_mode: Optional[str] = None,
+    obs_config: Optional[GhostObservationConfig] = None,
 ) -> Path:
     """Write episodes to ``path`` (``.npz`` is appended when missing).
 
     ``max_length`` sets the padded time axis (longer episodes are truncated);
-    ``None`` pads to the longest collected episode.
+    ``None`` pads to the longest collected episode.  ``obs_mode``/``obs_config``
+    default to whatever the episodes were recorded with, and are always written
+    into the header so a reader knows how to rebuild the observations.
     """
     path = Path(path)
     if path.suffix != ".npz":
@@ -477,6 +572,13 @@ def save_dataset(
 
     arrays = pad_episodes(episodes, obs_dtype=obs_dtype, max_length=max_length)
     stats = dataset_statistics(episodes)
+    recorded_mode = obs_mode or (episodes[0].obs_mode if episodes else STATE_OBS_MODE)
+    observation = observation_metadata(
+        recorded_mode,
+        arrays["observations"].shape[2:],
+        obs_config,
+        dtype=str(arrays["observations"].dtype),
+    )
     header: Dict[str, Any] = {
         "format": DATASET_FORMAT,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -484,6 +586,9 @@ def save_dataset(
         "steps": stats["steps"],
         "obs_shape": list(arrays["observations"].shape[2:]),
         "obs_dtype": str(arrays["observations"].dtype),
+        "obs_mode": observation["mode"],
+        "observation": observation,
+        "policies": sorted({episode.policy for episode in episodes}),
         # Callers should pass the real action-space size; the fallback is only
         # an upper bound derived from the recorded actions.
         "action_dim": int(arrays["actions"].max()) + 1 if arrays["actions"].size else 0,
@@ -528,6 +633,8 @@ def episodes_from_npz(path: Union[str, Path]) -> List[Episode]:
     stored ``length``.
     """
     arrays, metadata = load_dataset(path)
+    obs_mode, _ = observation_from_metadata(metadata)
+    observation_meta = dict(metadata.get("observation") or {})
     episodes: List[Episode] = []
     for index, chunk in enumerate(iter_episodes(arrays)):
         seed = int(arrays["episode_seeds"][index]) if "episode_seeds" in arrays else 0
@@ -554,6 +661,9 @@ def episodes_from_npz(path: Union[str, Path]) -> List[Episode]:
                     if "episode_wins" in arrays
                     else False
                 },
+                obs_mode=obs_mode,
+                policy=str(metadata.get("policy", "unknown")),
+                observation_meta=observation_meta,
             )
         )
     if not episodes:

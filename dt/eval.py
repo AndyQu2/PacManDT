@@ -66,12 +66,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-from data import (
+from dt.data import (
     DEFAULT_CONTEXT_LENGTH,
     DEFAULT_SUCCESS_THRESHOLD,
+    GhostObservationConfig,
+    OBS_MODES,
     dataset_statistics,
     episodes_from_npz,
     get_dims,
+    observation_from_metadata,
+    observation_metadata,
+    wrap_observation,
 )
 from dt import DTPolicy, HuggingfaceDT, load_checkpoint
 
@@ -150,17 +155,25 @@ def make_env(
     max_steps: Optional[int] = None,
     draw_state: bool = False,
     render_fps: int = DEFAULT_RENDER_FPS,
+    obs_mode: str = "state",
+    obs_config: Optional[GhostObservationConfig] = None,
 ):
-    """Create a :class:`pacman_env.PacmanEnv` configured for evaluation."""
+    """Create a :class:`pacman_env.PacmanEnv` configured for evaluation.
+
+    ``obs_mode="ghost"`` wraps the environment in
+    :class:`dt.data.observations.GhostObservationWrapper` so the policy sees the
+    same channels it was trained on.  The environment itself is never modified.
+    """
     from pacman_env import PacmanEnv
 
-    return PacmanEnv(
+    env = PacmanEnv(
         layout=layout,
         render_mode=render_mode,
         max_steps=max_steps,
         draw_state=draw_state,
         render_fps=render_fps,
     )
+    return wrap_observation(env, obs_mode, obs_config)
 
 
 def _import_pygame():
@@ -278,6 +291,8 @@ def evaluate(
     final_board: bool = False,
     draw_state: bool = False,
     verbose: bool = True,
+    obs_mode: str = "state",
+    obs_config: Optional[GhostObservationConfig] = None,
 ) -> List[EpisodeResult]:
     """Play ``episodes`` games headlessly and return one result per game.
 
@@ -293,6 +308,8 @@ def evaluate(
         render_mode="ansi" if final_board else None,
         max_steps=max_steps,
         draw_state=draw_state,
+        obs_mode=obs_mode,
+        obs_config=obs_config,
     )
     policy = DTPolicy(
         model,
@@ -473,6 +490,8 @@ def interactive(
     success_threshold: float = DEFAULT_SUCCESS_THRESHOLD,
     autopilot: bool = True,
     verbose: bool = True,
+    obs_mode: str = "state",
+    obs_config: Optional[GhostObservationConfig] = None,
 ) -> List[EpisodeResult]:
     """Open a window and evaluate the policy with a human in the loop.
 
@@ -487,6 +506,8 @@ def interactive(
         max_steps=max_steps,
         draw_state=draw_state,
         render_fps=render_fps,
+        obs_mode=obs_mode,
+        obs_config=obs_config,
     )
     policy = DTPolicy(
         model,
@@ -595,6 +616,21 @@ def format_target(target_return: Optional[float]) -> str:
     return "off" if target_return is None else f"{target_return:.1f}"
 
 
+def _observation_label(
+    obs_mode: str, config: Optional[GhostObservationConfig]
+) -> str:
+    """One-line description of the observation stack used for this run."""
+    if config is None:
+        return "state (single channel grid)"
+    extras = []
+    if not config.distance_fields:
+        extras.append("no distance fields")
+    if not config.globals:
+        extras.append("no globals")
+    suffix = f" ({', '.join(extras)})" if extras else ""
+    return f"ghost ({len(config.channel_names)} channels){suffix}"
+
+
 def print_header(
     *,
     checkpoint: Path,
@@ -605,10 +641,13 @@ def print_header(
     targets: Sequence[Optional[float]],
     device: torch.device,
     mode: str,
+    obs_mode: str = "state",
+    obs_config: Optional[GhostObservationConfig] = None,
 ) -> None:
     print("PacManDT evaluation")
     print(_row("checkpoint", checkpoint))
     print(_row("layout", layout))
+    print(_row("observation", _observation_label(obs_mode, obs_config)))
     print(
         _row(
             "model",
@@ -796,6 +835,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="headless plays without a window; interactive opens one")
     setup.add_argument("--device", default=None,
                        help="cpu / cuda / mps (default: auto)")
+    setup.add_argument("--obs-mode", default=None, choices=list(OBS_MODES),
+                       help="override the observation stack (default: the one stored in "
+                            "the checkpoint; a mismatch is refused, not silently applied)")
 
     run = parser.add_argument_group("episodes")
     run.add_argument("--episodes", type=int, default=DEFAULT_EPISODES,
@@ -862,13 +904,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     max_steps = None if args.max_steps <= 0 else int(args.max_steps)
     targets: List[Optional[float]] = list(args.target_return or [payload.get("target_return")])
 
+    # The observation stack is part of the checkpoint contract: a ghost-trained
+    # model must be fed the ghost channels, a legacy one the plain grid.
+    obs_mode, obs_config = observation_from_metadata(payload)
+    if args.obs_mode and args.obs_mode != obs_mode:
+        print(
+            f"warning: checkpoint was trained with obs_mode={obs_mode!r}; "
+            f"ignoring --obs-mode {args.obs_mode!r}",
+            file=sys.stderr,
+        )
+
     # A checkpoint only understands the layout it was trained on; catching the
     # mismatch here beats a confusing shape error inside the policy.
-    expected = get_dims(layout).state_dim
+    expected = get_dims(layout, obs_mode=obs_mode, ghost_config=obs_config).state_dim
     if expected != model.state_dim:
         print(
             f"error: the checkpoint expects a {model.state_dim}-dim state but layout "
-            f"{layout!r} has {expected}. Pass the layout it was trained on with --layout.",
+            f"{layout!r} with obs_mode={obs_mode!r} has {expected}. Pass the layout it "
+            f"was trained on with --layout.",
             file=sys.stderr,
         )
         return 2
@@ -882,6 +935,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         targets=targets,
         device=device,
         mode=args.mode,
+        obs_mode=obs_mode,
+        obs_config=obs_config,
     )
 
     runs: List[Dict[str, Any]] = []
@@ -902,6 +957,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             success_threshold=args.success_threshold,
             autopilot=not args.manual,
             verbose=not args.quiet,
+            obs_mode=obs_mode,
+            obs_config=obs_config,
         )
         all_results.extend(results)
         if not results:
@@ -934,6 +991,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 final_board=args.final_board,
                 draw_state=args.draw_state,
                 verbose=not args.quiet,
+                obs_mode=obs_mode,
+                obs_config=obs_config,
             )
             all_results.extend(results)
             summary = summarize(results, success_threshold=args.success_threshold)
@@ -955,6 +1014,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "layout": layout,
             "state_dim": model.state_dim,
             "act_dim": model.act_dim,
+            "obs_mode": obs_mode,
+            "observation": observation_metadata(obs_mode, config=obs_config, layout=layout),
             "context_length": context_length,
             "return_scale": return_scale,
             "device": str(device),

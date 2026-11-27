@@ -57,21 +57,40 @@ import torch
 from torch import nn
 from transformers import DecisionTransformerConfig
 
-from data import (
+from dt.data import (
     DEFAULT_CONTEXT_LENGTH,
     DataCollector,
     Episode,
+    GhostObservationConfig,
+    OBS_MODES,
+    STATE_OBS_MODE,
     dims_from_dataset,
     episodes_from_npz,
     load_dataset,
     make_dt_dataloader,
+    observation_from_metadata,
+    observation_metadata,
     recommend_context_length,
     recommend_max_length,
+    wrap_observation,
 )
 from dt import DTPolicy, HuggingfaceDT, load_checkpoint, save_checkpoint
 
 DEFAULT_OUT_DIR = Path("runs")
 DEFAULT_RETURN_SCALE = 1.0
+
+
+def ghost_config_from_args(args: argparse.Namespace) -> Optional[GhostObservationConfig]:
+    """Ghost channel selection from the CLI flags (``None`` for ``--obs-mode state``)."""
+    if args.obs_mode != "ghost":
+        return None
+    base = GhostObservationConfig()
+    return GhostObservationConfig(
+        distance_fields=not args.no_distance,
+        globals=not args.no_globals,
+        max_distance=int(args.max_distance) if args.max_distance else base.max_distance,
+        dtype=base.dtype,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -82,8 +101,13 @@ def _episodes_from_npz(path: Path) -> List[Episode]:
     return episodes_from_npz(path)
 
 
-def get_dataset(args: argparse.Namespace) -> Tuple[Dict[str, Any], str]:
-    """Return ``(dataset_dict, layout)``, collecting episodes when needed."""
+def get_dataset(args: argparse.Namespace) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
+    """Return ``(dataset_dict, layout, observation)``, collecting episodes when needed.
+
+    ``observation`` is the JSON-friendly observation description (mode, channels,
+    ``obs_shape``, ``feature_dim``) that travels into the checkpoint so
+    evaluation can rebuild the exact same observation stack.
+    """
     if args.data is None:
         layout = args.layout or "classic"
         max_length = args.max_length or recommend_max_length(
@@ -100,10 +124,15 @@ def get_dataset(args: argparse.Namespace) -> Tuple[Dict[str, Any], str]:
             eval_fraction=args.eval_fraction,
             max_length=max_length,
             progress=not args.quiet,
+            obs_mode=args.obs_mode,
+            obs_config=ghost_config_from_args(args),
         )
         dataset_dict = collector.collect(args.episodes, keep_won_only=args.keep_won_only)
         stats = collector.statistics
         layout = collector.layout
+        observation = collector.metadata.get("observation") or observation_metadata(
+            args.obs_mode, layout=layout, config=ghost_config_from_args(args)
+        )
         if args.save_data:
             path = collector.save_to_disk(args.save_data)
             print(f"[data] saved dataset to {path}")
@@ -115,17 +144,29 @@ def get_dataset(args: argparse.Namespace) -> Tuple[Dict[str, Any], str]:
             dataset_dict = collector.dataset_dict
             stats = collector.statistics
             layout = collector.layout
+            observation = collector.metadata.get("observation") or observation_metadata(
+                collector.obs_mode, layout=layout, config=collector.obs_config
+            )
         elif path.suffix == ".npz":
             print(f"[data] loading .npz dataset from {path}")
+            episodes = _episodes_from_npz(path)
+            recorded = episodes[0]
+            obs_mode, obs_config = observation_from_metadata(
+                {"obs_mode": recorded.obs_mode, "observation": recorded.observation_meta}
+            )
             collector = DataCollector(
-                layout=args.layout or "classic",
+                layout=args.layout or recorded.layout or "classic",
                 eval_fraction=args.eval_fraction,
                 max_length=args.max_length,
+                obs_mode=obs_mode,
+                obs_config=obs_config,
             )
-            episodes = _episodes_from_npz(path)
             dataset_dict = collector.from_episodes(episodes)
             stats = collector.statistics
             layout = episodes[0].layout if episodes[0].layout != "unknown" else collector.layout
+            observation = collector.metadata.get("observation") or observation_metadata(
+                obs_mode, layout=layout, config=obs_config
+            )
         else:
             raise FileNotFoundError(f"--data must be a directory or a .npz file, got {path}")
 
@@ -137,7 +178,11 @@ def get_dataset(args: argparse.Namespace) -> Tuple[Dict[str, Any], str]:
             f"min={stats['min_return']:.1f} max={stats['max_return']:.1f} "
             f"mean_length={stats['mean_length']:.0f} win_rate={stats['win_rate']:.2f}"
         )
-    return dataset_dict, layout
+    print(
+        f"[data] observation mode={observation.get('mode', 'state')} "
+        f"shape={observation.get('obs_shape')} state_dim={observation.get('feature_dim')}"
+    )
+    return dataset_dict, layout, observation
 
 
 def with_undiscounted_returns(dataset_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -374,11 +419,16 @@ def rollout(
     render_fps: int,
     seed: int,
     device: torch.device,
+    obs_mode: str = "state",
+    obs_config: Optional[GhostObservationConfig] = None,
 ) -> Dict[str, Any]:
     """Play ``episodes`` games with the greedy ``DTPolicy`` and report returns."""
     from pacman_env import PacmanEnv
 
     env = PacmanEnv(layout=layout, render_mode=render_mode, max_steps=max_steps)
+    # The transformer was trained on this observation mode, so the evaluation
+    # environment must produce the exact same channels.
+    env = wrap_observation(env, obs_mode, obs_config)
     policy = DTPolicy(
         model,
         context_length=context_length,
@@ -463,6 +513,16 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--keep-won-only", action="store_true", help="keep only winning episodes")
     data.add_argument("--eval-fraction", type=float, default=0.1,
                       help="fraction of episodes held out for evaluation")
+    data.add_argument("--obs-mode", type=str, default=STATE_OBS_MODE,
+                      choices=list(OBS_MODES),
+                      help="observation space recorded during collection; "
+                           "'ghost' adds the ghost channels (recommended)")
+    data.add_argument("--no-distance", action="store_true",
+                      help="--obs-mode ghost only: drop the BFS distance planes")
+    data.add_argument("--no-globals", action="store_true",
+                      help="--obs-mode ghost only: drop the frightened-timer/lives planes")
+    data.add_argument("--max-distance", type=int, default=None,
+                      help="--obs-mode ghost only: BFS distance clamp (default 40)")
 
     model = parser.add_argument_group("model")
     model.add_argument("--hidden-size", type=int, default=128)
@@ -594,6 +654,15 @@ def _max_length_of(dataset_dict: Dict[str, Any], args: argparse.Namespace) -> in
     return int(args.max_length or args.max_steps)
 
 
+def _observation_of(
+    payload: Dict[str, Any], args: argparse.Namespace
+) -> Tuple[str, Optional[GhostObservationConfig]]:
+    """Observation mode/config stored in a checkpoint (falls back to the CLI flags)."""
+    if "observation" in payload or "obs_mode" in payload:
+        return observation_from_metadata(payload)
+    return args.obs_mode, ghost_config_from_args(args)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     device = _resolve_device(args.device)
@@ -613,9 +682,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         target_return = args.target_return
         if target_return is None:
             target_return = payload.get("target_return")
+        obs_mode, obs_config = _observation_of(payload, args)
         print(
             f"[load] {args.checkpoint}: state_dim={model.state_dim} act_dim={model.act_dim} "
-            f"context_length={payload.get('context_length')} target_return={target_return}"
+            f"context_length={payload.get('context_length')} target_return={target_return} "
+            f"obs_mode={obs_mode}"
         )
         rollout(
             model,
@@ -629,20 +700,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             render_fps=args.render_fps,
             seed=args.seed,
             device=device,
+            obs_mode=obs_mode,
+            obs_config=obs_config,
         )
         return 0
 
     # ---- data --------------------------------------------------------
-    dataset_dict, layout = get_dataset(args)
+    dataset_dict, layout, observation = get_dataset(args)
     dataset_dict = with_undiscounted_returns(dataset_dict)
     train_ds, eval_ds = split_train_eval(dataset_dict, args.seed)
     max_length = _max_length_of(dataset_dict, args)
     context_length = _resolve_context_length(args, max_length)
     dims = dims_from_dataset(dataset_dict, layout=layout)
+    obs_mode, obs_config = observation_from_metadata(
+        {"obs_mode": observation.get("mode", STATE_OBS_MODE), "observation": observation}
+    )
+    if dims.state_dim != observation.get("feature_dim", dims.state_dim):
+        raise SystemExit(
+            f"dataset state_dim {dims.state_dim} does not match the recorded "
+            f"observation {observation.get('obs_shape')}"
+        )
 
     return_scale = return_scale_of(train_ds)
     target_return = args.target_return if args.target_return is not None else mean_return_of(train_ds)
     print(f"[setup] layout={layout} state_dim={dims.state_dim} act_dim={dims.act_dim}")
+    print(
+        f"[setup] obs_mode={obs_mode} obs_shape={dims.obs_shape} "
+        f"channels={len(dims.channels)}"
+    )
     print(
         f"[setup] max_length={max_length} context_length={context_length} "
         f"return_scale={return_scale:.2f} target_return={target_return:.1f} device={device}"
@@ -674,6 +759,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         layout=layout,
         extra={
             "dims": dims.as_dict(),
+            "obs_mode": obs_mode,
+            "observation": observation,
             "max_length": max_length,
             "history": history,
             "train_args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
@@ -696,11 +783,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             render_fps=args.render_fps,
             seed=args.seed + 1000,
             device=device,
+            obs_mode=obs_mode,
+            obs_config=obs_config,
         )
 
     metrics = {
         "layout": layout,
         "dims": dims.as_dict(),
+        "obs_mode": obs_mode,
+        "observation": observation,
         "max_length": max_length,
         "context_length": context_length,
         "return_scale": return_scale,

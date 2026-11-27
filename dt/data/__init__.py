@@ -21,6 +21,13 @@ Modules
 :mod:`dt.data.dims`
     ``state_dim`` / ``act_dim`` / ``max_length`` helpers
     (``python -m dt.data.dims`` prints them for every layout).
+:mod:`dt.data.observations`
+    The ghost-aware observation stack (``obs_mode="ghost"``): per-ghost state
+    channels, BFS distance fields and scalar globals, exposed as a Gymnasium
+    wrapper so ``pacman_env`` itself stays untouched.
+:mod:`dt.data.protocol`
+    The collection protocol: a behaviour-policy portfolio, quality-tier
+    curation, success balancing and a stable hash train/eval split.
 
 Typical use::
 
@@ -28,6 +35,13 @@ Typical use::
 
     collector = DataCollector(layout="classic", policy="heuristic", workers=8)
     dataset = collector.collect(num_episodes=1000)
+
+Ghost-aware collection with the recommended protocol::
+
+    from dt.data import CollectionProtocol
+
+    result = CollectionProtocol(layout="classic", episodes=2000, workers=16).run()
+    result.report
 """
 
 from .cli import DEFAULT_OUTPUT, build_parser, main
@@ -67,6 +81,23 @@ from .episodes import (
 from .hf_dataset import DataCollector, DTSequenceDataset, HF_DATASET_FORMAT, DEFAULT_HF_DIR, dataset_card, \
     dataset_statistics_from_dict, dataset_to_episodes, episode_features, episodes_to_dataset, episodes_to_dataset_dict, \
     flatten_to_transitions, make_dt_dataloader, split_episodes
+from .observations import (
+    CHANNELS,
+    GHOST_OBS_MODE,
+    OBS_MODES,
+    STATE_OBS_MODE,
+    GhostObservationConfig,
+    GhostObservationWrapper,
+    ResolvedObservation,
+    describe_observation,
+    make_ghost_env,
+    observation_feature_dim,
+    observation_from_metadata,
+    observation_metadata,
+    observation_shape,
+    resolve_observation,
+    wrap_observation,
+)
 from .policies import (
     UNREACHABLE,
     HeuristicPolicy,
@@ -76,6 +107,20 @@ from .policies import (
     epsilon_greedy_policy,
     make_policy,
     random_policy,
+)
+from .protocol import (
+    DEFAULT_PORTFOLIO,
+    CollectionProtocol,
+    ProtocolResult,
+    balance_classes,
+    build_policy_schedule,
+    curate_episodes,
+    format_report,
+    parse_portfolio,
+    protocol_report,
+    quality_tiers,
+    recommended_protocol,
+    split_by_hash,
 )
 
 __all__ = [
@@ -123,6 +168,35 @@ __all__ = [
     "get_state_dim",
     "recommend_context_length",
     "recommend_max_length",
+    # observation stack (ghost channels)
+    "CHANNELS",
+    "GHOST_OBS_MODE",
+    "OBS_MODES",
+    "STATE_OBS_MODE",
+    "GhostObservationConfig",
+    "GhostObservationWrapper",
+    "ResolvedObservation",
+    "describe_observation",
+    "make_ghost_env",
+    "observation_feature_dim",
+    "observation_from_metadata",
+    "observation_metadata",
+    "observation_shape",
+    "resolve_observation",
+    "wrap_observation",
+    # collection protocol
+    "DEFAULT_PORTFOLIO",
+    "CollectionProtocol",
+    "ProtocolResult",
+    "balance_classes",
+    "build_policy_schedule",
+    "curate_episodes",
+    "format_report",
+    "parse_portfolio",
+    "protocol_report",
+    "quality_tiers",
+    "recommended_protocol",
+    "split_by_hash",
     # Hugging Face (lazy, needs the "hub" extra)
     "hf_dataset",
     "DataCollector",

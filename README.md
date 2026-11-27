@@ -18,8 +18,9 @@ Decision-Transformer tooling stay independent:
 | path        | contents |
 | ----------- | -------- |
 | `pacman_env/` | The Gymnasium environment: `env.py`, `rendering.py`, `wrappers.py`, the Pygame-free simulation in `game/` and the sprite assets in `assets/`. Nothing here depends on DT training. |
-| `dt/data`    | Everything about *data*: behaviour policies (`policies.py`), trajectory collection and the `.npz` format (`episodes.py`), `state_dim`/`act_dim`/`max_length` helpers (`dims.py`), the Hugging Face `DataCollector` (`hf_dataset.py`) and the `python -m dt.data` CLI (`cli.py`). |
-| `dt/`         | The model and the trainer: `dt/dt.py` (`HuggingfaceDT`, `DTPolicy`, checkpoints) and `dt/train.py` (`python -m dt.train`). |
+| `dt/data`    | Everything about *data*: behaviour policies (`policies.py`), trajectory collection and the `.npz` format (`episodes.py`), the observation stack (`observations.py`), the collection protocol (`protocol.py`), `state_dim`/`act_dim`/`max_length` helpers (`dims.py`), the Hugging Face `DataCollector` (`hf_dataset.py`) and the `python -m dt.data` CLI (`cli.py`). |
+| `dt/`         | The model and the trainer: `dt/dt.py` (`HuggingfaceDT`, `DTPolicy`, checkpoints), `dt/train.py` (`python -m dt.train`) and `dt/eval.py` (`python -m dt.eval`). |
+| `docs/`       | Long-form notes, including [`docs/ghost-observations.md`](docs/ghost-observations.md): the ghost-observation and collection-protocol report. |
 | `tests/`      | pytest suite for both packages. |
 
 ---
@@ -184,6 +185,98 @@ For pixel observations use `obs_type="rgb"` plus
 
 ---
 
+## Observation modes: `state` vs `ghost`
+
+`pacman_env` is deliberately untouched: its native observation is a single
+`int8` grid (`obs_type="state"`) in which `-1` means *wall **or** a normal
+ghost*, `5` means *vulnerable **or** eaten ghost*, and Pac-Man is not encoded at
+all. That is a fine input for a CNN, but the Decision Transformer embeds every
+**cell** with one linear layer (`state_dim` → `hidden_size`), so the collapsed
+grid forces a single weight to mean both "wall" and "ghost".
+
+`dt.data.observations` therefore adds an **observation stack** as a Gymnasium
+wrapper. The environment, the maze and the game rules are unchanged; only the
+tensor that reaches the transformer changes, and `state_dim` is derived from it
+so `HuggingfaceDT`/`DecisionTransformerConfig` need **no modification**.
+
+```python
+from dt.data import make_ghost_env, GHOST_OBS_MODE, wrap_observation
+from pacman_env import PacmanEnv
+
+env = make_ghost_env(PacmanEnv(layout="classic"))   # PacmanEnv + GhostObservationWrapper
+obs, info = env.reset(seed=0)
+obs.shape, obs.dtype                                # (11, 22, 19) int8
+
+# or wrap an env you already built (frame stacking etc. keeps working)
+env = wrap_observation(PacmanEnv(layout="classic"), obs_mode=GHOST_OBS_MODE)
+```
+
+`obs_mode="state"` is the legacy behaviour and returns exactly what `pacman_env`
+returns, so old datasets and checkpoints keep loading.
+
+### Channels
+
+| idx | channel            | values | why it is there |
+| --- | ------------------ | ------ | --------------- |
+| 0 | `wall`              | 0/1 | impassable tiles (border, wall, ghost door) |
+| 1 | `pellet`            | 0/1 | pellet still on the tile |
+| 2 | `power_pellet`      | 0/1 | power pellet still on the tile |
+| 3 | `ghost_normal`      | 0..4 | **count** of dangerous ghosts on the tile |
+| 4 | `ghost_vulnerable`  | 0..4 | count of frightened (edible) ghosts |
+| 5 | `ghost_eaten`       | 0..4 | count of eaten ghosts (eyes returning home) |
+| 6 | `player`            | 0/1 | Pac-Man's tile |
+| 7 | `player_distance`   | 0..100 | BFS distance from Pac-Man over walkable tiles |
+| 8 | `ghost_distance`    | 0..100 | BFS distance to the nearest **normal** ghost |
+| 9 | `frightened_timer`  | 0..100 | remaining frightened time, scaled |
+| 10 | `lives`            | 0..100 | lives left, scaled |
+
+Scalars (channels 9–10) are broadcast over the grid so the stack stays a dense
+`(C, rows, cols)` array and every mode has the same rank. Distances are capped at
+`max_distance` (default `40`) and normalised to `0..100`; `100` marks
+*unreachable*, which is exactly the signal a planner needs and a CNN cannot
+invent from a static grid.
+
+| layout         | `state` | `ghost` (full) | `ghost` (`--no-distance --no-globals`) |
+| -------------- | ------- | -------------- | -------------------------------------- |
+| `classic`      | 418     | **4598**       | 2926 |
+| `google`       | 374     | **4114**       | 2618 |
+| `medium`       | 133     | **1463**       | 931  |
+| `medium_small` | 56      | **616**        | 392  |
+| `small`        | 42      | **462**        | 294  |
+
+```python
+from dt.data import describe_observation, get_dims
+
+print(describe_observation("ghost", layout="classic"))   # channel table above
+get_dims("classic", obs_mode="ghost").state_dim          # 4598
+get_dims("classic", obs_mode="ghost").channels           # 11 names
+```
+
+`GhostObservationConfig` controls the stack: `distance_fields` (channels 7–8),
+`globals` (channels 9–10), `max_distance` and `dtype`. Turning the auxiliary
+channels off shrinks `classic` from 4598 to 2926 inputs, which is a useful
+ablation — the pure "per-tile entity" encoding without the planner hints.
+
+### How the mode travels with the data
+
+Nothing is inferred at training time. The mode is written into every artifact:
+
+* `.npz` → `metadata["obs_mode"]` + `metadata["observation"]`
+  (`mode`, `obs_shape`, `feature_dim`, `dtype`, `channels`, `layout`, and the
+  config fields `distance_fields`, `globals`, `max_distance`).
+* HF dataset → `pacman_dt_metadata.json` and the dataset card channel table;
+  `DataCollector.load_from_disk` restores it.
+* checkpoint → `payload["obs_mode"]` / `payload["observation"]`, and
+  `metrics.json`.
+
+`python -m dt.train` reads the mode from the dataset, `python -m dt.eval` reads
+it from the checkpoint, and both reject a mismatched `--layout` instead of
+silently feeding the model the wrong tensor. Use `--obs-mode ghost|state` to
+force a mode and `--no-distance` / `--no-globals` / `--max-distance N` to shape
+the stack.
+
+---
+
 ## Collecting trajectories for a Decision Transformer
 
 A Decision Transformer (DT) is trained on episodes in which every step carries
@@ -214,6 +307,10 @@ collected:
 Saved 1000 episodes to data\pacman_dt.npz
 ```
 
+> **`python -m dt.collect` is deprecated.** The legacy module still works — it
+> translates its old flags and forwards to `python -m dt.data`, printing a
+> warning — but `python -m dt.data` is the supported entry point.
+
 ### Flags
 
 | flag                  | default              | meaning                                                       |
@@ -223,6 +320,15 @@ Saved 1000 episodes to data\pacman_dt.npz
 | `--episodes`          | `1000`               | episodes to collect                                           |
 | `--max-steps`         | `1000`               | per-episode step cap (`0` = unlimited)                        |
 | `--policy`            | `heuristic`          | `heuristic`, `random` or `epsilon_greedy`                     |
+| `--portfolio`         | off                  | mix behaviour policies, e.g. `heuristic=0.6,epsilon_greedy=0.3,random=0.1` (overrides `--policy`) |
+| `--obs-mode`          | `state`              | `state` (legacy grid) or `ghost` (11-channel stack)            |
+| `--no-distance`       | off                  | `ghost` mode: drop the two BFS distance channels               |
+| `--no-globals`        | off                  | `ghost` mode: drop the frightened-timer / lives channels       |
+| `--max-distance`      | `40`                 | `ghost` mode: BFS distance cap before normalisation            |
+| `--balance-success`   | off                  | cap successful episodes at `--success-ratio` × failures        |
+| `--success-ratio`     | `2.0`                | the ratio used by `--balance-success`                          |
+| `--num-tiers`         | `4`                  | return quantiles reported (and used for curation)              |
+| `--eval-fraction`     | `0.1`                | HF only: share of episodes held out for the `eval` split       |
 | `--epsilon`           | `0.05`               | exploration rate for `epsilon_greedy`                         |
 | `--gamma`             | `0.99`               | discount used for the returns-to-go                           |
 | `--seed`              | `0`                  | base seed; episode *i* uses `seed + i`                        |
@@ -255,6 +361,77 @@ contain recovery behaviour. Custom policies are just callables
 `(obs, info, env, rng) -> action`; pass one directly to
 `collect_trajectories(policy=my_policy)`.
 
+### Collection protocol
+
+A DT can only be as good as the trajectories it imitates, and a dataset that is
+100 % expert has two problems: it never shows the states where an agent must
+*recover* (being chased, a life lost, a cornered position), and its
+return-to-go distribution is so narrow that the conditioning input carries no
+information. `dt.data.protocol` implements the protocol used for all
+ghost-observation runs:
+
+1. **Policy portfolio** — every episode is played by one of several behaviour
+   policies in fixed, deterministic proportions
+   (`heuristic=0.6, epsilon_greedy=0.3, random=0.1` by default). The expert
+   supplies competent play, `epsilon_greedy` supplies near-miss and recovery
+   states, `random` supplies the low-return anchor that makes the
+   return-to-go conditioning meaningful. The schedule is smooth round-robin, so
+   `workers=16` sees the same mix as `workers=1`.
+2. **Quality tiers** — episodes are bucketed into `--num-tiers` return
+   quantiles and the tier table is printed, so you can see whether the dataset
+   actually spans a useful range of returns before you spend GPU hours.
+3. **Success balancing** — `--balance-success` caps successful episodes at
+   `--success-ratio` × the number of failures. Without it a strong portfolio
+   can drift to >90 % wins, which makes `target_return` useless.
+4. **Stable hash split** — the train/eval split is decided by a hash of the
+   episode seed, not by position, so appending episodes to a dataset never moves
+   an existing episode from `eval` into `train` (the classic silent-leak bug in
+   iteratively collected datasets).
+
+```python
+from dt.data import CollectionProtocol, recommended_protocol
+
+protocol = recommended_protocol("classic", episodes=4000, workers=16, seed=0)
+print(protocol.describe())          # observation stack + portfolio + curation
+result = protocol.run()             # collect -> curate -> split -> report
+print(result.report["splits"])      # {'train': 3600, 'eval': 400}
+result.dataset_dict()               # HF DatasetDict built from the same split
+```
+
+`CollectionProtocol` also exposes the steps individually (`schedule()`,
+`collect()`, `curate()`, `split()`, `report()`), and the helpers
+`parse_portfolio`, `build_policy_schedule`, `quality_tiers`, `balance_classes`,
+`curate_episodes`, `split_by_hash`, `protocol_report` and `format_report` are
+public if you want to script your own pipeline. From the command line the same
+machinery is one flag:
+
+```powershell
+python -m dt.data --episodes 4000 --workers 16 `
+    --obs-mode ghost --portfolio heuristic=0.6,epsilon_greedy=0.3,random=0.1 `
+    --balance-success --num-tiers 4 --format hf --hf-out data/pacman_dt_hf
+```
+
+The printed report is what ends up in the dataset metadata, so a run is
+reproducible from the artifact alone:
+
+```text
+episodes     : 4000 kept / 4000 collected
+transitions  : 4000000
+return       : mean 41.87  std 26.14  min -6.00  max 128.00
+success rate : 24.6%   win rate 0.4%
+split        : train 3600  eval 400
+by policy    :
+  heuristic         2400 eps  (60.0%)  mean return   61.20  success  40.1%
+  epsilon_greedy    1200 eps  (30.0%)  mean return   38.55  success  22.0%
+  random             400 eps  (10.0%)  mean return   -5.80  success   0.0%
+by tier      :
+  tier 0             1000 eps  return   -6.00 ..   12.00  success   0.0%
+  tier 1             1000 eps  return   12.00 ..   44.00  success   1.2%
+  tier 2             1000 eps  return   44.00 ..   70.00  success  33.5%
+  tier 3             1000 eps  return   70.00 ..  128.00  success  63.8%
+```
+
+
 ### Dimensions and `max_length`
 
 `dt.data.dims` is the single place that answers "how big is my state and how long
@@ -272,7 +449,9 @@ get_dims("classic", flatten=False).obs_shape    # (22, 19)        <- raw grid
 
 get_state_dim("classic", frame_stack=4)         # 1672 (4 stacked frames)
 get_state_dim("classic", obs_type="rgb")        # 755136 (rendered pixels)
-print(describe_layouts())                       # ASCII table, same as --show-dims
+get_state_dim("classic", obs_mode="ghost")      # 4598 (11 x 22 x 19)
+get_dims("classic", obs_mode="ghost").channels  # the 11 channel names
+print(describe_layouts(obs_mode="ghost"))       # ASCII table, same as --show-dims
 ```
 
 The helpers also read the numbers off things you already have, so a training
@@ -297,8 +476,15 @@ dims_from_dataset(dataset_dict)       # a Hugging Face DatasetDict
 
 `state_dim` is the flattened observation size (`rows * cols` for the default
 `obs_type="state"`, times `frame_stack` if you stack frames); `act_dim` is always
-`5`. `DTDims` also carries `obs_shape`, `obs_dtype`, `layout`, `frame_stack` and
-`obs_type`, so it can be passed straight into a model factory.
+`5`. `DTDims` also carries `obs_shape`, `obs_dtype`, `layout`, `frame_stack`,
+`obs_type`, `obs_mode` and `channels`, so it can be passed straight into a model
+factory. Every `dims_from_*` helper *infers* `obs_mode` from the data it is
+given, so ghost datasets report `4598` on `classic` without being told.
+
+The `state_dim` values in the table above are for `obs_mode="state"`; the
+`ghost` stack multiplies them by the number of channels (see
+[Observation modes](#observation-modes-state-vs-ghost)) — `classic` becomes
+**4598**, `small` **462**.
 
 #### Setting `max_length`
 
@@ -388,7 +574,13 @@ which steps are real.
 
 `metadata` is a JSON string with `format` (`pacman-dt/decision-transformer-v1`),
 `created`, `episodes`, `steps`, `obs_shape`, `obs_dtype`, `action_dim`,
-`max_length`, the CLI arguments, and a `statistics` block.
+`max_length`, `obs_mode`, `observation` (the resolved observation stack:
+`mode`, `obs_shape`, `feature_dim`, `dtype`, `channels`, `layout`, and the
+config fields `distance_fields`, `globals`, `max_distance`), `policies` (the
+behaviour policies that produced the episodes), `portfolio` (the requested
+mixture), the CLI arguments, and a `statistics` block. With
+`--obs-mode ghost`, `obs_shape` is `(11, rows, cols)` and `state_dim` is 11 × the
+maze area.
 
 `terminated` marks a genuine end of episode (win or game over) while `truncated`
 marks a time-limit cut; returns-to-go are always computed over the steps that
@@ -613,6 +805,9 @@ smoke run on the tiny layout takes a few seconds:
 | `--episodes` | `50` | episodes to collect when `--data` is omitted |
 | `--max-steps` | `1000` | per-episode step limit |
 | `--max-length` | recommended | pad/truncate episodes to this many steps |
+| `--obs-mode` | the dataset's, else `state` | `state` or `ghost` observation stack |
+| `--no-distance`, `--no-globals`, `--max-distance` | - | shape the `ghost` stack (see [Observation modes](#observation-modes-state-vs-ghost)) |
+| `--portfolio`, `--balance-success`, `--num-tiers` | - | collection protocol used when `--data` is omitted |
 | `--context-length` | `30` | steps of history the transformer sees (`K`) |
 | `--epochs` | `5` | passes over the dataset |
 | `--batch-size` | `64` | windows per gradient step |
@@ -639,10 +834,16 @@ Everything else (`--policy`, `--epsilon`, `--workers`, `--eval-fraction`,
 ```python
 import numpy as np
 from dt.dt import DTPolicy, load_checkpoint
+from dt.data import observation_from_metadata, wrap_observation
 from pacman_env import PacmanEnv
 
 model, payload = load_checkpoint("runs/dt-classic/checkpoint.pt")
-env = PacmanEnv(layout=payload["layout"], render_mode=None)
+obs_mode, obs_config = observation_from_metadata(payload.get("observation"))
+env = wrap_observation(
+    PacmanEnv(layout=payload["layout"], render_mode=None),
+    obs_mode=obs_mode,          # the stack the weights were trained on
+    config=obs_config,
+)
 policy = DTPolicy(
     model,
     context_length=payload["context_length"],
@@ -693,16 +894,66 @@ rebuild them:
   "return_scale": 28.4,       # returns_to_go were divided by this during training
   "target_return": 612.0,     # conditioning target used at inference
   "layout": "classic",
-  "dims": {"state_dim": 418, "act_dim": 5, ...},
+  "obs_mode": "ghost",        # the observation stack the weights expect
+  "observation": {...},       # resolved stack: obs_shape, dtype, channels, config fields
+  "dims": {"state_dim": 4598, "act_dim": 5, ...},
   "history": {"train_loss": [...], "eval_loss": [...]},
 }
 ```
 
 `load_checkpoint(path)` returns `(model, payload)`, so `--eval-only` needs no
-extra flags: the layout, context length and return scale all travel with the
-weights.
+extra flags: the layout, observation mode, context length and return scale all
+travel with the weights. `python -m dt.eval` reads the same payload, rebuilds the
+matching wrapper and refuses to run if `--layout` disagrees with the checkpoint.
+
+### Evaluating a checkpoint (`python -m dt.eval`)
+
+`dt/eval.py` is the standalone evaluator: it rebuilds the observation stack from
+the checkpoint, plays headless episodes, optionally compares against the dataset
+the model was trained on, and writes a JSON report.
+
+```powershell
+# newest checkpoint in runs/, 10 episodes per target return
+python -m dt.eval
+
+# a sweep over conditioning targets, with the full report on disk
+python -m dt.eval --checkpoint runs/dt-classic/checkpoint.pt `
+    --target-return 100 300 600 --episodes 20 --json
+
+# watch it play
+python -m dt.eval --mode interactive --render-fps 30
+```
+
+| flag | default | meaning |
+| ---- | ------- | ------- |
+| `--checkpoint` | newest `runs/*/checkpoint.pt` | checkpoint file or run directory |
+| `--layout` | the checkpoint's | maze layout (a mismatch is refused) |
+| `--target-return` | the checkpoint's | one or more conditioning targets |
+| `--context-length` | the checkpoint's | steps of history (`K`) |
+| `--obs-mode` | the checkpoint's | `state` or `ghost`; a mismatch is refused, not silently applied |
+| `--mode` | `headless` | `headless` or `interactive` (pygame window) |
+| `--episodes` | `10` | games per target return |
+| `--max-steps` | `0` | step cap (`0` = let episodes end naturally) |
+| `--data` | none | dataset to compare the agent against |
+| `--json` | `<run>/eval.json` | write the full report (includes `obs_mode` and `observation`) |
+
+The header always states which stack is in use, so a report is self-describing:
+
+```text
+PacManDT evaluation
+checkpoint   : runs\dt-classic\checkpoint.pt
+layout       : classic
+observation  : ghost (11 channels)
+model        : state_dim 4598, act_dim 5, ... params
+context      : 30 steps
+return scale : 28.40
+target return: 600.0
+device       : cuda
+mode         : headless
+```
 
 ### What to expect
+
 
 The heuristic policy used for collection walks the maze with BFS, so a few dozen
 episodes are enough to see the loss fall. A measured 40-episode, 12-epoch run on

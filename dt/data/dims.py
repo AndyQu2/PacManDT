@@ -41,6 +41,13 @@ from pacman_env.env import RGB_OBS, STATE_OBS
 from pacman_env.game.action import Action
 from pacman_env.game.map import Map
 
+from .observations import (
+    GHOST_OBS_MODE,
+    STATE_OBS_MODE,
+    GhostObservationConfig,
+    resolve_observation,
+)
+
 #: Context length (K) recommended for DT training.  The original paper uses 20
 #: for D4RL locomotion and 30 for Atari; PacMan episodes are long enough that
 #: 30 gives the model a useful history without inflating the batch.
@@ -62,6 +69,9 @@ RECOMMENDED_MAX_LENGTH: Dict[str, int] = {
 #: for vectorised/blocked kernels.
 MAX_LENGTH_ROUNDING = 32
 
+#: Channel name reported for the environment's own single-channel grid.
+_STATE_CHANNELS: Tuple[str, ...] = ("state",)
+
 
 @dataclass(frozen=True)
 class DTDims:
@@ -75,6 +85,8 @@ class DTDims:
     flatten: bool = True
     frame_stack: int = 1
     obs_type: str = STATE_OBS
+    obs_mode: str = STATE_OBS_MODE
+    channels: Tuple[str, ...] = ()
 
     @property
     def state_shape(self) -> Tuple[int, ...]:
@@ -92,13 +104,15 @@ class DTDims:
             "flatten": self.flatten,
             "frame_stack": self.frame_stack,
             "obs_type": self.obs_type,
+            "obs_mode": self.obs_mode,
+            "channels": list(self.channels),
         }
 
     def __str__(self) -> str:  # pragma: no cover - cosmetic
         return (
             f"DTDims(layout={self.layout!r}, state_dim={self.state_dim}, "
             f"act_dim={self.act_dim}, obs_shape={self.obs_shape}, "
-            f"obs_dtype={self.obs_dtype!r})"
+            f"obs_dtype={self.obs_dtype!r}, obs_mode={self.obs_mode!r})"
         )
 
 
@@ -110,15 +124,27 @@ def get_obs_shape(
     *,
     obs_type: str = STATE_OBS,
     frame_stack: int = 1,
+    obs_mode: str = STATE_OBS_MODE,
+    ghost_config: Optional[GhostObservationConfig] = None,
 ) -> Tuple[int, ...]:
-    """Shape of a single observation, exactly as :class:`PacmanEnv` returns it.
+    """Shape of a single observation, exactly as the collector stores it.
 
     ``obs_type="state"`` gives ``(rows, cols)`` (``int8``); ``obs_type="rgb"``
     gives ``(height, width, 3)`` (``uint8``).  ``frame_stack > 1`` prepends the
     stacking axis, matching the usual ``FrameStack`` wrapper.
+
+    ``obs_mode="ghost"`` switches to the ghost-aware stack from
+    :mod:`dt.data.observations` — ``(channels, rows, cols)``, i.e. ``(11, 22, 19)``
+    on ``classic`` — and ignores ``obs_type`` (the channels are built from the
+    tile grid, not from the rendered frame).
     """
     if frame_stack <= 0:
         raise ValueError("frame_stack must be a positive integer")
+
+    if obs_mode not in (STATE_OBS_MODE, None, ""):
+        resolved = resolve_observation(obs_mode, layout=layout, config=ghost_config)
+        base = resolved.obs_shape
+        return (frame_stack, *base) if frame_stack > 1 else base
 
     maze = Map(layout)
     rows, cols = maze.shape
@@ -139,6 +165,8 @@ def get_state_dim(
     *,
     obs_type: str = STATE_OBS,
     frame_stack: int = 1,
+    obs_mode: str = STATE_OBS_MODE,
+    ghost_config: Optional[GhostObservationConfig] = None,
 ) -> int:
     """Number of scalars in one observation — the DT input width.
 
@@ -147,8 +175,19 @@ def get_state_dim(
         get_state_dim("classic")            # 418  (22 * 19)
         get_state_dim("small")              # 42   (7 * 6)
         get_state_dim("classic", frame_stack=4)   # 1672
+        get_state_dim("classic", obs_mode="ghost")  # 4598  (11 * 22 * 19)
     """
-    return int(np.prod(get_obs_shape(layout, obs_type=obs_type, frame_stack=frame_stack)))
+    return int(
+        np.prod(
+            get_obs_shape(
+                layout,
+                obs_type=obs_type,
+                frame_stack=frame_stack,
+                obs_mode=obs_mode,
+                ghost_config=ghost_config,
+            )
+        )
+    )
 
 
 def get_act_dim(layout: Optional[str] = None) -> int:
@@ -167,15 +206,24 @@ def get_dims(
     obs_type: str = STATE_OBS,
     frame_stack: int = 1,
     obs_dtype: str = "int8",
+    obs_mode: str = STATE_OBS_MODE,
+    ghost_config: Optional[GhostObservationConfig] = None,
 ) -> "DTDims":
     """All DT shape information for ``layout`` in one object.
 
     ``flatten=True`` (the usual choice for a DT, which embeds a flat vector)
     reports ``obs_shape == (state_dim,)``; ``flatten=False`` keeps the raw
-    ``(rows, cols)`` shape for CNN encoders.
+    ``(rows, cols)`` (or ``(channels, rows, cols)``) shape for CNN encoders.
     """
-    raw_shape = get_obs_shape(layout, obs_type=obs_type, frame_stack=frame_stack)
+    raw_shape = get_obs_shape(
+        layout,
+        obs_type=obs_type,
+        frame_stack=frame_stack,
+        obs_mode=obs_mode,
+        ghost_config=ghost_config,
+    )
     state_dim = int(np.prod(raw_shape))
+    mode, channels = _infer_obs_mode(raw_shape, obs_mode=obs_mode, ghost_config=ghost_config)
     return DTDims(
         state_dim=state_dim,
         act_dim=get_act_dim(layout),
@@ -185,7 +233,44 @@ def get_dims(
         flatten=bool(flatten),
         frame_stack=int(frame_stack),
         obs_type=str(obs_type),
+        obs_mode=mode,
+        channels=channels,
     )
+
+
+def _infer_obs_mode(
+    obs_shape: Sequence[int],
+    *,
+    obs_mode: Optional[str] = None,
+    ghost_config: Optional[GhostObservationConfig] = None,
+) -> Tuple[str, Tuple[str, ...]]:
+    """Best-effort ``(obs_mode, channel_names)`` for a stored observation shape.
+
+    A two-dimensional shape is always the environment's own grid.  A
+    three-dimensional shape is matched against the ghost stack for every known
+    layout (with and without the optional distance/global channels), so a
+    dataset can be described correctly without carrying extra metadata.
+    """
+    if obs_mode not in (None, "", STATE_OBS_MODE):
+        resolved = resolve_observation(obs_mode, layout="classic", config=ghost_config)
+        return resolved.mode, resolved.channels
+
+    shape = tuple(int(dim) for dim in obs_shape)
+    if len(shape) != 3:
+        return STATE_OBS_MODE, _STATE_CHANNELS
+    candidates: Tuple[GhostObservationConfig, ...] = (
+        ghost_config,
+        GhostObservationConfig(),
+        GhostObservationConfig(distance_fields=False, globals=False),
+    )
+    for layout in Map.available_layouts():
+        for config in candidates:
+            if config is None:
+                continue
+            resolved = resolve_observation(GHOST_OBS_MODE, layout=layout, config=config)
+            if resolved.obs_shape == shape:
+                return GHOST_OBS_MODE, resolved.channels
+    return STATE_OBS_MODE, _STATE_CHANNELS
 
 
 # ----------------------------------------------------------------------
@@ -214,6 +299,16 @@ def _env_layout(env: Any) -> str:
     return "unknown"
 
 
+def _env_obs_mode(env: Any) -> Optional[str]:
+    """Observation mode advertised by ``env`` (or by any wrapper around it)."""
+    candidates = [env, getattr(env, "env", None), getattr(env, "unwrapped", env)]
+    for candidate in candidates:
+        mode = getattr(candidate, "obs_mode", None)
+        if isinstance(mode, str):
+            return mode
+    return None
+
+
 def dims_from_env(env: Any) -> DTDims:
     """Read ``state_dim``/``act_dim`` from a (possibly wrapped) Gymnasium env.
 
@@ -232,6 +327,7 @@ def dims_from_env(env: Any) -> DTDims:
 
     obs_shape = _space_shape(obs_space)
     state_dim = int(np.prod(obs_shape))
+    mode, channels = _infer_obs_mode(obs_shape, obs_mode=_env_obs_mode(env))
     return DTDims(
         state_dim=state_dim,
         act_dim=_space_size(act_space),
@@ -239,6 +335,8 @@ def dims_from_env(env: Any) -> DTDims:
         obs_dtype=str(getattr(obs_space, "dtype", "int8")),
         layout=_env_layout(env),
         flatten=obs_shape == (state_dim,),
+        obs_mode=mode,
+        channels=channels,
     )
 
 
@@ -267,6 +365,7 @@ def dims_from_arrays(
         )
     obs_shape = tuple(int(dim) for dim in observations.shape[2:])
     state_dim = int(np.prod(obs_shape))
+    mode, channels = _infer_obs_mode(obs_shape)
     return DTDims(
         state_dim=state_dim,
         act_dim=get_act_dim() if act_dim is None else int(act_dim),
@@ -274,6 +373,8 @@ def dims_from_arrays(
         obs_dtype=str(observations.dtype),
         layout=layout or "unknown",
         flatten=obs_shape == (state_dim,),
+        obs_mode=mode,
+        channels=channels,
     )
 
 
@@ -288,6 +389,7 @@ def dims_from_episodes(
         raise ValueError("cannot derive dimensions from an empty list of episodes")
     obs_shape = tuple(int(dim) for dim in np.asarray(episodes[0].observations).shape[1:])
     state_dim = int(np.prod(obs_shape))
+    mode, channels = _infer_obs_mode(obs_shape)
     return DTDims(
         state_dim=state_dim,
         act_dim=get_act_dim() if act_dim is None else int(act_dim),
@@ -295,6 +397,8 @@ def dims_from_episodes(
         obs_dtype=str(np.asarray(episodes[0].observations).dtype),
         layout=layout or "unknown",
         flatten=obs_shape == (state_dim,),
+        obs_mode=mode,
+        channels=channels,
     )
 
 
@@ -321,6 +425,7 @@ def dims_from_dataset(
     obs_feature = features["observations"]
     obs_shape = tuple(int(dim) for dim in obs_feature.shape[1:])
     state_dim = int(np.prod(obs_shape))
+    mode, channels = _infer_obs_mode(obs_shape)
     return DTDims(
         state_dim=state_dim,
         act_dim=get_act_dim() if act_dim is None else int(act_dim),
@@ -328,6 +433,8 @@ def dims_from_dataset(
         obs_dtype=str(getattr(obs_feature, "dtype", "int8")),
         layout=layout or "unknown",
         flatten=obs_shape == (state_dim,),
+        obs_mode=mode,
+        channels=channels,
     )
 
 
@@ -414,26 +521,34 @@ def recommend_context_length(
     return max(int(minimum), min(int(default), int(max_length)))
 
 
-def describe_layouts(layouts: Optional[Sequence[str]] = None) -> str:
+def describe_layouts(
+    layouts: Optional[Sequence[str]] = None,
+    *,
+    obs_mode: str = STATE_OBS_MODE,
+    ghost_config: Optional[GhostObservationConfig] = None,
+) -> str:
     """Human-readable table of every layout's dims and recommended ``max_length``."""
     names = list(layouts) if layouts is not None else Map.available_layouts()
     header = f"{'layout':<13}{'obs_shape':<15}{'state_dim':>10}{'act_dim':>9}{'max_length':>12}"
     lines = [header, "-" * len(header)]
     for name in names:
-        shape = get_obs_shape(name)
+        shape = get_obs_shape(name, obs_mode=obs_mode, ghost_config=ghost_config)
         lines.append(
-            f"{name:<13}{str(shape):<15}{get_state_dim(name):>10}{get_act_dim():>9}"
-            f"{recommend_max_length(layout=name):>12}"
+            f"{name:<13}{str(shape):<15}"
+            f"{get_state_dim(name, obs_mode=obs_mode, ghost_config=ghost_config):>10}"
+            f"{get_act_dim():>9}{recommend_max_length(layout=name):>12}"
         )
     return "\n".join(lines)
 
 
 __all__ = [
     "DEFAULT_CONTEXT_LENGTH",
+    "GHOST_OBS_MODE",
     "MAX_LENGTH_ROUNDING",
     "RECOMMENDED_MAX_LENGTH",
     "RGB_OBS",
     "STATE_OBS",
+    "STATE_OBS_MODE",
     "DTDims",
     "describe_layouts",
     "dims_from_arrays",

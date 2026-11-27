@@ -77,9 +77,32 @@ from .episodes import (
     filter_episodes,
     pad_episodes,
 )
+from .observations import (
+    GHOST_OBS_MODE,
+    STATE_OBS_MODE,
+    GhostObservationConfig,
+    observation_from_metadata,
+    observation_metadata,
+    resolve_observation,
+)
 
 HF_DATASET_FORMAT = "pacman-dt/hf-decision-transformer-v1"
 DEFAULT_HF_DIR = "data/pacman_dt_hf"
+
+#: One-line documentation per ghost-observation channel (used by the dataset card).
+_CHANNEL_DOCS: Dict[str, str] = {
+    "wall": "1 where the tile is a wall",
+    "pellet": "1 where a pellet is still present",
+    "power_pellet": "1 where a power pellet is still present",
+    "ghost_normal": "number of normal (dangerous) ghosts on the tile",
+    "ghost_vulnerable": "number of frightened (edible) ghosts on the tile",
+    "ghost_eaten": "number of eaten ghosts (eyes returning home) on the tile",
+    "player": "1 on the player's tile",
+    "player_distance": "BFS distance to the player, bucketed 0..max_distance",
+    "ghost_distance": "BFS distance to the nearest dangerous ghost",
+    "frightened_timer": "remaining frightened time, bucketed 0..max_distance",
+    "lives": "remaining lives, bucketed 0..max_distance",
+}
 
 _ARRAY_TYPES = {1: None, 2: Array2D, 3: Array3D, 4: Array4D, 5: Array5D}
 
@@ -118,6 +141,8 @@ def episode_features(
             "episode_id": Value("int64"),
             "seed": Value("int64"),
             "layout": Value("string"),
+            "policy": Value("string"),
+            "obs_mode": Value("string"),
             "score": Value("int64"),
             "total_reward": Value("float32"),
             "success": Value("bool"),
@@ -202,6 +227,10 @@ def episodes_to_dataset(
         "episode_id": np.arange(len(episodes), dtype=np.int64),
         "seed": np.asarray([episode.seed for episode in episodes], dtype=np.int64),
         "layout": [episode.layout for episode in episodes],
+        "policy": [str(getattr(episode, "policy", "unknown")) for episode in episodes],
+        "obs_mode": [
+            str(getattr(episode, "obs_mode", STATE_OBS_MODE)) for episode in episodes
+        ],
         "score": np.asarray([episode.score for episode in episodes], dtype=np.int64),
         "total_reward": np.asarray(
             [episode.total_reward for episode in episodes], dtype=np.float32
@@ -238,6 +267,8 @@ def dataset_to_episodes(dataset: Dataset) -> List[Episode]:
                 timesteps=np.asarray(row["timesteps"], dtype=np.int64)[:length],
                 seed=int(row["seed"]),
                 layout=str(row["layout"]),
+                policy=str(row.get("policy", "unknown") or "unknown"),
+                obs_mode=str(row.get("obs_mode", STATE_OBS_MODE) or STATE_OBS_MODE),
                 score=int(row["score"]),
                 total_reward=float(row["total_reward"]),
                 success=bool(row["success"]),
@@ -269,9 +300,23 @@ def episodes_to_dataset_dict(
     eval_fraction: float = 0.0,
     max_length: Optional[int] = None,
     obs_dtype: Optional[Union[str, np.dtype]] = None,
+    *,
+    train_episodes: Optional[Sequence[Episode]] = None,
+    eval_episodes: Optional[Sequence[Episode]] = None,
 ) -> DatasetDict:
-    """Build a ``DatasetDict`` with ``train`` (and optionally ``eval``) splits."""
-    train_episodes, eval_episodes = split_episodes(episodes, eval_fraction)
+    """Build a ``DatasetDict`` with ``train`` (and optionally ``eval``) splits.
+
+    Pass ``train_episodes``/``eval_episodes`` to use a split that was decided
+    elsewhere - for instance the stable hash split of
+    :func:`dt.data.protocol.split_by_hash`, which keeps an evaluation episode on
+    the evaluation side even after more data is collected.  Without them the
+    trailing ``eval_fraction`` of ``episodes`` is held out.
+    """
+    if train_episodes is None and eval_episodes is None:
+        train_episodes, eval_episodes = split_episodes(episodes, eval_fraction)
+    else:
+        train_episodes = list(train_episodes or [])
+        eval_episodes = list(eval_episodes or [])
     if max_length is None:
         # one shared padded length so train and eval have identical shapes
         max_length = max((int(len(episode.rewards)) for episode in episodes), default=0)
@@ -433,6 +478,7 @@ def dataset_card(
         f"* format: `{HF_DATASET_FORMAT}`",
         f"* episodes: **{stats.get('episodes', metadata.get('episodes', '?'))}**",
         f"* transitions: **{stats.get('steps', metadata.get('steps', '?'))}**",
+        f"* observation mode: `{metadata.get('obs_mode', STATE_OBS_MODE)}`",
         f"* gamma: `{metadata.get('gamma', 0.99)}`",
         f"* max episode length: `{metadata.get('max_length', '?')}`",
         f"* splits: {', '.join(splits or ['train'])}",
@@ -470,6 +516,24 @@ def dataset_card(
         "```",
         "",
     ]
+    observation = metadata.get("observation") or {}
+    channels = observation.get("channels") or []
+    if metadata.get("obs_mode", STATE_OBS_MODE) != STATE_OBS_MODE and channels:
+        body += [
+            "### Observation channels",
+            "",
+            f"`obs = ds[:][\"observations\"]` is `(N, max_length, {len(channels)}, rows, cols)` "
+            f"{observation.get('dtype', 'int8')} — flatten to "
+            f"`state_dim={observation.get('feature_dim', '?')}` for the transformer.",
+            "",
+            "| # | channel | meaning |",
+            "| --- | --- | --- |",
+        ]
+        body += [
+            f"| {index} | `{name}` | {_CHANNEL_DOCS.get(name, '')} |"
+            for index, name in enumerate(channels)
+        ]
+        body.append("")
     if features is not None:
         body += ["### Features", "", "```", str(features), "```", ""]
     body += [
@@ -615,6 +679,20 @@ def make_dt_dataloader(
     )
 
 
+def _infer_obs_from_dataset(
+    dataset_dict: DatasetDict,
+) -> Tuple[str, Optional[GhostObservationConfig]]:
+    """Recover ``(obs_mode, config)`` from a dataset's observation feature shape."""
+    try:
+        first = next(iter(dataset_dict.values()))
+        obs_shape = tuple(int(dim) for dim in first.features["observations"].shape[1:])
+    except (StopIteration, KeyError, AttributeError):  # pragma: no cover - defensive
+        return STATE_OBS_MODE, None
+    if len(obs_shape) == 3:
+        return GHOST_OBS_MODE, GhostObservationConfig()
+    return STATE_OBS_MODE, None
+
+
 # ----------------------------------------------------------------------
 # The collector
 # ----------------------------------------------------------------------
@@ -637,6 +715,14 @@ class DataCollector:
         :func:`dt.data.episodes.collect_trajectories`.
     obs_dtype:
         dtype used to store observations (``int8`` by default).
+    obs_mode:
+        Observation space recorded in the dataset: ``"state"`` (the
+        environment's own grid) or ``"ghost"`` (the ghost-aware stack from
+        :mod:`dt.data.observations`, which adds per-ghost channels, distance
+        fields and scalar globals).
+    obs_config:
+        Optional :class:`~dt.data.observations.GhostObservationConfig` used when
+        ``obs_mode="ghost"`` (which optional channels to emit).
     eval_fraction:
         Fraction of episodes moved into an ``eval`` split.
     max_length:
@@ -659,6 +745,8 @@ class DataCollector:
     render_mode: Optional[str] = None
     progress: bool = True
     obs_dtype: str = "int8"
+    obs_mode: str = STATE_OBS_MODE
+    obs_config: Optional[GhostObservationConfig] = None
     eval_fraction: float = 0.0
     max_length: Optional[int] = None
     repo_id: Optional[str] = None
@@ -691,6 +779,8 @@ class DataCollector:
             render_mode=self.render_mode,
             progress=self.progress,
             workers=self.workers,
+            obs_mode=self.obs_mode,
+            obs_config=self.obs_config,
         )
         kept = list(self.episodes)
         if keep_won_only:
@@ -707,8 +797,14 @@ class DataCollector:
         episodes: Sequence[Episode],
         *,
         eval_fraction: Optional[float] = None,
+        train_episodes: Optional[Sequence[Episode]] = None,
+        eval_episodes: Optional[Sequence[Episode]] = None,
     ) -> DatasetDict:
-        """Build (or rebuild) the HF dataset from already collected episodes."""
+        """Build (or rebuild) the HF dataset from already collected episodes.
+
+        Pass ``train_episodes``/``eval_episodes`` to keep a split that was
+        decided elsewhere (see :func:`dt.data.protocol.split_by_hash`).
+        """
         episodes = list(episodes)
         if not episodes:
             raise ValueError("cannot build a dataset from an empty list of episodes")
@@ -720,6 +816,8 @@ class DataCollector:
             eval_fraction=fraction,
             max_length=self.max_length,
             obs_dtype=self.obs_dtype,
+            train_episodes=train_episodes,
+            eval_episodes=eval_episodes,
         )
         self.metadata = self._build_metadata(episodes, fraction)
         return self.dataset_dict
@@ -732,6 +830,26 @@ class DataCollector:
             if self.dataset_dict and "train" in self.dataset_dict
             else max((episode.length for episode in episodes), default=0)
         )
+        recorded_mode = self.obs_mode
+        recorded_config = self.obs_config
+        for episode in episodes:
+            mode = getattr(episode, "obs_mode", STATE_OBS_MODE)
+            if mode and mode != STATE_OBS_MODE:
+                recorded_mode = mode
+                if not recorded_config:
+                    recorded_config = GhostObservationConfig.from_dict(
+                        (getattr(episode, "observation_meta", {}) or {}).get("config", {})
+                    )
+                break
+        observation = observation_metadata(
+            recorded_mode, layout=self.layout, config=recorded_config
+        )
+        policies = sorted(
+            {
+                str(getattr(episode, "policy", "unknown") or "unknown")
+                for episode in episodes
+            }
+        )
         return {
             "format": HF_DATASET_FORMAT,
             "source_format": DATASET_FORMAT,
@@ -741,6 +859,9 @@ class DataCollector:
             "max_steps": self.max_steps,
             "max_length": max_length,
             "policy": self.policy,
+            "policies": policies,
+            "obs_mode": observation["mode"],
+            "observation": observation,
             "epsilon": self.epsilon,
             "gamma": self.gamma,
             "frame_skip": self.frame_skip,
@@ -769,6 +890,25 @@ class DataCollector:
         if self.dataset_dict is not None:
             return dataset_statistics_from_dict(self.dataset_dict)
         return {"episodes": 0, "steps": 0}
+
+    def describe(self) -> str:
+        """Human-readable summary of the observation space and splits."""
+        resolved = resolve_observation(
+            self.obs_mode, layout=self.layout, config=self.obs_config
+        )
+        lines = [
+            f"layout:        {self.layout}",
+            f"obs_mode:      {resolved.mode}",
+            f"obs_shape:     {resolved.obs_shape} {resolved.dtype}",
+            f"state_dim:     {resolved.feature_dim}",
+            f"policy:        {self.policy}",
+        ]
+        if self.dataset_dict is not None:
+            lines.append(
+                "splits:        "
+                + ", ".join(f"{name}={len(split)}" for name, split in self.dataset_dict.items())
+            )
+        return "\n".join(lines)
 
     def card(self) -> str:
         """Render the Hub dataset card for the current dataset."""
@@ -808,6 +948,11 @@ class DataCollector:
             collector.metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             collector.layout = collector.metadata.get("layout", collector.layout)
             collector.policy = collector.metadata.get("policy", collector.policy)
+            collector.obs_mode, collector.obs_config = observation_from_metadata(
+                collector.metadata
+            )
+        else:
+            collector.obs_mode, collector.obs_config = _infer_obs_from_dataset(dataset_dict)
         collector.episodes = [
             episode
             for split in dataset_dict.values()
@@ -894,6 +1039,11 @@ class DataCollector:
             else 0,
             "statistics": stats,
         }
+        collector.obs_mode, collector.obs_config = _infer_obs_from_dataset(dataset_dict)
+        collector.metadata["obs_mode"] = collector.obs_mode
+        collector.metadata["observation"] = observation_metadata(
+            collector.obs_mode, layout=collector.layout, config=collector.obs_config
+        )
         return collector
 
     # -- helpers -------------------------------------------------------
